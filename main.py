@@ -1,473 +1,614 @@
-import json
-import re
-import time
-import uuid
-from datetime import datetime
-from pathlib import Path
-from urllib.parse import urlparse
 
+import streamlit as st
 import cv2
 import numpy as np
-import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
+from datetime import datetime
+import io
+import csv
 
-APP_TITLE = "QR Scanner Pro"
-HISTORY_FILE = Path(__file__).resolve().with_name("qr_scanner_history.json")
-MAX_UPLOAD_MB = 12
-MAX_HISTORY = 500
+# =========================================================
+# PAGE CONFIGURATION
+# =========================================================
 
 st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🔎",
+    page_title="QR Scanner Pro",
+    page_icon="📷",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded"
 )
 
-# ---------------------------- Styling ----------------------------------------
-st.markdown(
-    """
-    <style>
-    :root { color-scheme: dark; }
+# =========================================================
+# CUSTOM CSS
+# =========================================================
+
+st.markdown("""
+<style>
     .stApp {
-        background:
-          radial-gradient(ellipse at 10% 0%, rgba(78, 55, 180, .22), transparent 38%),
-          radial-gradient(ellipse at 95% 10%, rgba(0, 155, 220, .14), transparent 34%),
-          #090d18;
-        color: #eef2ff;
+        background: linear-gradient(135deg, #0b1020, #111827);
+        color: #f8fafc;
     }
-    [data-testid="stHeader"] { background: rgba(9,13,24,.7); }
-    .block-container { max-width: 1200px; padding-top: 1.6rem; padding-bottom: 3rem; }
+
+    [data-testid="stHeader"] {
+        background: transparent;
+    }
+
     .hero {
-        border: 1px solid rgba(145,160,255,.20);
-        background: linear-gradient(135deg, rgba(27,35,67,.94), rgba(17,24,45,.88));
-        border-radius: 24px; padding: 26px 28px; margin-bottom: 20px;
-        box-shadow: 0 18px 60px rgba(0,0,0,.20);
+        padding: 28px;
+        border: 1px solid #334155;
+        border-radius: 22px;
+        background: linear-gradient(120deg, #172554, #312e81, #111827);
+        margin-bottom: 25px;
     }
-    .brand { font-size: 2rem; font-weight: 850; letter-spacing: -.045em; margin: 0; }
-    .brand span { color: #8b9bff; }
-    .sub { color: #aab6d4; margin-top: 6px; }
+
+    .hero h1 {
+        font-size: 42px;
+        color: white;
+        margin-bottom: 8px;
+    }
+
+    .hero p {
+        color: #cbd5e1;
+        font-size: 16px;
+    }
+
     .panel {
-        border: 1px solid rgba(145,160,255,.16);
-        background: rgba(17,24,43,.82);
-        border-radius: 20px; padding: 20px; margin-bottom: 16px;
+        background: #172033;
+        border: 1px solid #334155;
+        border-radius: 16px;
+        padding: 20px;
+        margin-bottom: 15px;
     }
-    .muted { color: #9ba9c8; font-size: .92rem; }
-    .result {
-        white-space: pre-wrap; overflow-wrap: anywhere;
-        background: rgba(6,11,24,.8); border: 1px solid rgba(124,142,255,.28);
-        border-radius: 14px; padding: 16px; color: #eaf0ff;
-        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+
+    .result-box {
+        background: #102b24;
+        border: 1px solid #10b981;
+        border-radius: 14px;
+        padding: 18px;
+        overflow-wrap: anywhere;
     }
-    .pill {
-        display:inline-block; border-radius:999px; padding:4px 10px;
-        background:rgba(108,126,255,.16); border:1px solid rgba(130,145,255,.25);
-        color:#cbd4ff; font-size:.8rem; margin-right:6px;
+
+    .small-text {
+        color: #94a3b8;
+        font-size: 13px;
     }
-    div.stButton > button, div.stDownloadButton > button {
-        border-radius: 12px; font-weight: 650; min-height: 2.6rem;
+
+    div.stButton > button {
+        border-radius: 10px;
+        font-weight: 600;
+        min-height: 44px;
     }
-    [data-testid="stFileUploader"] {
-        border: 1px dashed rgba(139,155,255,.5); border-radius: 16px;
-        background: rgba(23,32,58,.45); padding: 8px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------- Helpers ----------------------------------------
-def read_history():
-    try:
-        if HISTORY_FILE.exists():
-            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        st.warning("History file could not be read. A fresh history is being used.")
-    return []
+</style>
+""", unsafe_allow_html=True)
 
 
-def write_history(items):
-    try:
-        HISTORY_FILE.write_text(
-            json.dumps(items[:MAX_HISTORY], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return True
-    except OSError:
-        st.error("Could not save scan history. Check folder permissions.")
-        return False
+# =========================================================
+# SESSION STATE
+# =========================================================
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "last_scan" not in st.session_state:
+    st.session_state.last_scan = None
 
 
-def classify_payload(value):
-    text = (value or "").strip()
-    low = text.lower()
-    if low.startswith(("https://", "http://")):
-        return "Website URL"
-    if low.startswith("wifi:"):
-        return "Wi-Fi configuration"
-    if low.startswith("mailto:") or re.search(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text):
-        return "Email"
-    if low.startswith("tel:"):
-        return "Phone number"
-    if low.startswith("begin:vcard"):
-        return "Contact card"
-    if low.startswith(("geo:", "maps:")):
-        return "Location"
-    if low.startswith(("upi://", "bitcoin:", "ethereum:")):
-        return "Payment / crypto URI"
-    return "Plain text"
+# =========================================================
+# QR SCANNING FUNCTIONS
+# =========================================================
+
+def open_image(uploaded_file):
+    """Uploaded image PIL format-ലേക്ക് മാറ്റുന്നു."""
+    image = Image.open(uploaded_file)
+    image.load()
+    return image.convert("RGB")
 
 
-def safe_http_url(value):
-    try:
-        parsed = urlparse((value or "").strip())
-        return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc) and not any(
-            ch in value for ch in ("\r", "\n", "\x00")
-        )
-    except (ValueError, TypeError):
-        return False
+def scan_qr_codes(pil_image):
+    """ചിത്രത്തിൽനിന്ന് ഒന്നോ അതിലധികമോ QR codes വായിക്കുന്നു."""
 
+    image_array = np.array(pil_image)
+    image_bgr = cv2.cvtColor(
+        image_array,
+        cv2.COLOR_RGB2BGR
+    )
 
-def decode_image(image):
-    """Return a list of decoded QR strings using OpenCV."""
-    if image is None:
-        return []
     detector = cv2.QRCodeDetector()
-    found = []
+    results = []
 
-    # Try multi-code support first, if this OpenCV build provides it.
+    # ഒന്നിലധികം QR codes ഒരുമിച്ച് വായിക്കാൻ ശ്രമിക്കുന്നു.
     try:
-        ok, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
-        if ok and decoded_info:
-            found.extend(s.strip() for s in decoded_info if isinstance(s, str) and s.strip())
-    except (cv2.error, AttributeError, ValueError):
+        success, decoded_info, points, _ = (
+            detector.detectAndDecodeMulti(image_bgr)
+        )
+
+        if success and decoded_info:
+            for value in decoded_info:
+                if value and value.strip():
+                    results.append(value.strip())
+    except cv2.error:
         pass
 
-    if not found:
+    # Multi-scan വിജയിച്ചില്ലെങ്കിൽ സാധാരണ scan ശ്രമിക്കുന്നു.
+    if not results:
         try:
-            text, points, _ = detector.detectAndDecode(image)
-            if text and text.strip():
-                found.append(text.strip())
+            value, points, _ = detector.detectAndDecode(
+                image_bgr
+            )
+
+            if value and value.strip():
+                results.append(value.strip())
         except cv2.error:
             pass
 
-    # If no result, retry grayscale and a scaled copy for small QR codes.
-    if not found:
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-            for candidate in (gray, cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)):
-                text, _, _ = detector.detectAndDecode(candidate)
-                if text and text.strip():
-                    found.append(text.strip())
-                    break
-        except (cv2.error, ValueError):
-            pass
-
-    # Stable de-duplication
-    return list(dict.fromkeys(found))
+    # Duplicate results നീക്കം ചെയ്യുന്നു.
+    return list(dict.fromkeys(results))
 
 
-def add_to_history(payload, source):
-    payload = payload.strip()
-    if not payload:
+def save_results(results, source):
+    """പുതിയ scan-ന്റെ ഫലങ്ങൾ history-യിൽ ചേർക്കുന്നു."""
+
+    if not results:
         return
-    items = st.session_state.history
-    # Avoid a duplicate at the top from repeated camera frames.
-    if items and items[0].get("content") == payload and items[0].get("source") == source:
-        try:
-            age = time.time() - float(items[0].get("epoch", 0))
-            if age < 15:
-                return
-        except (TypeError, ValueError):
-            pass
-    entry = {
-        "id": uuid.uuid4().hex[:12],
-        "content": payload,
-        "type": classify_payload(payload),
+
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    for value in results:
+        record = {
+            "Time": timestamp,
+            "Source": source,
+            "Result": value
+        }
+
+        if record not in st.session_state.history:
+            st.session_state.history.append(record)
+
+    st.session_state.last_scan = {
+        "time": timestamp,
         "source": source,
-        "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "epoch": time.time(),
-        "favorite": False,
+        "results": results
     }
-    st.session_state.history.insert(0, entry)
-    st.session_state.history = st.session_state.history[:MAX_HISTORY]
-    write_history(st.session_state.history)
 
 
-def set_results(values, source):
-    clean = [v.strip() for v in values if isinstance(v, str) and v.strip()]
-    if not clean:
-        st.session_state.last_error = "No QR code was detected. Try a clearer, brighter image."
-        return
-    st.session_state.last_error = ""
-    st.session_state.results = clean
-    st.session_state.result_source = source
-    for value in clean:
-        add_to_history(value, source)
+def make_csv(records):
+    """Scan history CSV file ആക്കുന്നു."""
+
+    output = io.StringIO()
+    fields = ["Time", "Source", "Result"]
+
+    writer = csv.DictWriter(
+        output,
+        fieldnames=fields
+    )
+
+    writer.writeheader()
+    writer.writerows(records)
+
+    return output.getvalue().encode("utf-8-sig")
 
 
-# ---------------------------- State ------------------------------------------
-if "history" not in st.session_state:
-    st.session_state.history = read_history()
-if "results" not in st.session_state:
-    st.session_state.results = []
-if "result_source" not in st.session_state:
-    st.session_state.result_source = ""
-if "last_error" not in st.session_state:
-    st.session_state.last_error = ""
-if "camera_seen" not in st.session_state:
-    st.session_state.camera_seen = set()
+# =========================================================
+# SIDEBAR
+# =========================================================
 
-# ---------------------------- Header -----------------------------------------
-st.markdown(
-    """
-    <div class="hero">
-      <div class="brand">◈ QR <span>SCANNER PRO</span></div>
-      <div class="sub">Scan anything. Instantly. &nbsp;·&nbsp; Real QR decoding, not a demo.</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Sidebar settings
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-    st.caption("QR Scanner Pro")
-    st.write(f"Maximum upload size: {MAX_UPLOAD_MB} MB")
-    st.write(f"History limit: {MAX_HISTORY} scans")
-    st.info("Camera access is requested by your browser. Public hosting usually needs HTTPS and compatible WebRTC networking.")
-    if st.button("🗑️ Clear all scan history", use_container_width=True):
+    st.markdown("## 📷 QR Scanner Pro")
+    st.caption("നിന്റെ Smart QR Scanning Tool")
+
+    st.divider()
+
+    page = st.radio(
+        "MENU",
+        [
+            "🏠 Home",
+            "📁 Image Scanner",
+            "📸 Camera Scanner",
+            "📜 Scan History",
+            "ℹ️ About"
+        ]
+    )
+
+    st.divider()
+
+    st.markdown("### 📊 Scan Statistics")
+    st.metric(
+        "ആകെ സ്കാൻ ഫലങ്ങൾ",
+        len(st.session_state.history)
+    )
+
+    if st.button("🗑️ Clear History", use_container_width=True):
         st.session_state.history = []
-        write_history([])
-        st.success("History cleared.")
+        st.session_state.last_scan = None
         st.rerun()
 
-# ---------------------------- Main modes -------------------------------------
-camera_tab, upload_tab, history_tab = st.tabs(["📷  Camera scanner", "🖼️  Upload image", "🕘  Scan history"])
+    st.markdown(
+        '<p class="small-text">QR Scanner Pro • Python + Streamlit</p>',
+        unsafe_allow_html=True
+    )
 
-with camera_tab:
-    st.markdown('<div class="panel"><h3>Live camera scanner</h3><p class="muted">Allow camera permission when your browser asks. Hold a QR code steadily in view.</p></div>', unsafe_allow_html=True)
-    try:
-        from streamlit_webrtc import RTCConfiguration, WebRtcMode, VideoProcessorBase, webrtc_streamer
 
-        class QRVideoProcessor(VideoProcessorBase):
-            def __init__(self):
-                self.detector = cv2.QRCodeDetector()
-                self.lock = __import__("threading").Lock()
-                self.latest = []
-                self.last_seen = {}
-                self.last_frame_error = ""
+# =========================================================
+# HEADER
+# =========================================================
 
-            def recv(self, frame):
-                img = frame.to_ndarray(format="bgr24")
-                try:
-                    decoded = []
-                    try:
-                        ok, infos, points, _ = self.detector.detectAndDecodeMulti(img)
-                        if ok and infos:
-                            decoded = [x.strip() for x in infos if isinstance(x, str) and x.strip()]
-                    except (cv2.error, AttributeError, ValueError):
-                        pass
-                    if not decoded:
-                        try:
-                            value, points, _ = self.detector.detectAndDecode(img)
-                            if value and value.strip():
-                                decoded = [value.strip()]
-                        except cv2.error:
-                            pass
+st.markdown("""
+<div class="hero">
+    <h1>📷 QR Scanner Pro</h1>
+    <p>
+        QR Code സ്കാൻ ചെയ്യൂ • വിവരങ്ങൾ വായിക്കൂ • ഫലങ്ങൾ
+        ഡൗൺലോഡ് ചെയ്യൂ
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
-                    now = time.time()
-                    with self.lock:
-                        for value in decoded:
-                            # Only re-publish a given value every 3 seconds to reduce duplicate events.
-                            if now - self.last_seen.get(value, 0) > 3:
-                                self.last_seen[value] = now
-                                self.latest.append(value)
-                        self.latest = self.latest[-10:]
 
-                    # Draw a simple visual outline when a QR is detected.
-                    if decoded:
-                        try:
-                            _, points = self.detector.detect(img)
-                            if points is not None:
-                                pts = points.astype(int).reshape(-1, 2)
-                                if len(pts) >= 4:
-                                    cv2.polylines(img, [pts], True, (100, 255, 160), 3)
-                        except (cv2.error, AttributeError, ValueError):
-                            pass
-                except Exception as exc:
-                    with self.lock:
-                        self.last_frame_error = str(exc)
-                return __import__("av").VideoFrame.from_ndarray(img, format="bgr24")
+# =========================================================
+# HOME PAGE
+# =========================================================
 
-            def take_latest(self):
-                with self.lock:
-                    values = self.latest[:]
-                    self.latest.clear()
-                    return values
+if page == "🏠 Home":
 
-        rtc_config = RTCConfiguration({
-            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-        })
-        webrtc_ctx = webrtc_streamer(
-            key="qr-scanner-live",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=rtc_config,
-            media_stream_constraints={"video": True, "audio": False},
-            video_processor_factory=QRVideoProcessor,
-            async_processing=True,
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "ആകെ സ്കാനുകൾ",
+            len(st.session_state.history)
         )
 
-        if webrtc_ctx.video_processor:
-            detected = webrtc_ctx.video_processor.take_latest()
-            if detected:
-                set_results(detected, "Camera")
-                st.success(f"Detected {len(detected)} QR code(s) from the live camera.")
-                st.rerun()
-            if webrtc_ctx.state.playing:
-                st.caption("🟢 Camera stream is running. Detected codes appear below.")
-            else:
-                st.caption("Camera is stopped. Press START to begin scanning.")
-    except ImportError:
-        st.error("Live camera support is not installed.")
-        st.code("python -m pip install streamlit-webrtc av")
-    except Exception as exc:
-        st.error("The camera integration could not start in this environment.")
-        st.caption(f"Details: {exc}")
-        st.info("Check browser camera permission, HTTPS (for public hosting), firewall settings, and WebRTC support.")
+    with col2:
+        st.metric(
+            "ഈ സെഷനിലെ ഫലങ്ങൾ",
+            len(st.session_state.last_scan["results"])
+            if st.session_state.last_scan else 0
+        )
 
-    st.markdown("#### Latest camera result")
-    if st.session_state.results and st.session_state.result_source == "Camera":
-        for idx, result in enumerate(st.session_state.results, 1):
-            st.markdown(f"**Result {idx} · {classify_payload(result)}**")
-            st.code(result, language=None)
-            if safe_http_url(result):
-                st.link_button("Open link", result)
-            st.button("Copy result", key=f"cam_copy_{idx}", on_click=lambda x=result: st.session_state.update(copy_payload=x))
-    else:
-        st.caption("No camera result yet.")
+    with col3:
+        st.metric(
+            "സ്കാനർ സ്റ്റാറ്റസ്",
+            "Ready ✅"
+        )
 
-with upload_tab:
-    st.markdown('<div class="panel"><h3>Scan an image</h3><p class="muted">Choose a QR code photo, screenshot, or saved image from your device.</p></div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader(
-        "Choose an image file",
-        type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
-        accept_multiple_files=False,
-        help=f"Maximum recommended file size: {MAX_UPLOAD_MB} MB.",
-        key="qr_upload",
+    st.markdown("## 🚀 QR Scanner ഉപയോഗിക്കാം")
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("""
+        <div class="panel">
+            <h3>📁 Image Scanner</h3>
+            <p>
+                മൊബൈലിലോ കമ്പ്യൂട്ടറിലോ ഉള്ള QR Code ചിത്രം
+                Upload ചെയ്ത് സ്കാൻ ചെയ്യാം.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button(
+            "📁 Image Scanner തുറക്കുക",
+            use_container_width=True
+        ):
+            st.session_state.open_page = "📁 Image Scanner"
+            st.rerun()
+
+    with right:
+        st.markdown("""
+        <div class="panel">
+            <h3>📸 Camera Scanner</h3>
+            <p>
+                ക്യാമറയിൽ QR Code കാണിച്ച് ഒരു ചിത്രം എടുത്ത്
+                അതിൽനിന്ന് വിവരങ്ങൾ വായിക്കാം.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button(
+            "📸 Camera Scanner തുറക്കുക",
+            use_container_width=True
+        ):
+            st.session_state.open_page = "📸 Camera Scanner"
+            st.rerun()
+
+    # Home-ൽനിന്നുള്ള navigation
+    if "open_page" in st.session_state:
+        target = st.session_state.pop("open_page")
+
+        if target == "📁 Image Scanner":
+            st.info("Sidebar-ൽ Image Scanner തിരഞ്ഞെടുക്കുക.")
+        elif target == "📸 Camera Scanner":
+            st.info("Sidebar-ൽ Camera Scanner തിരഞ്ഞെടുക്കുക.")
+
+    st.markdown("### ✨ പ്രധാന സവിശേഷതകൾ")
+
+    st.markdown("""
+    - 🖼️ PNG, JPG, JPEG തുടങ്ങിയ ചിത്രങ്ങൾ Upload ചെയ്യാം.
+    - 📷 ക്യാമറ ഉപയോഗിച്ച് QR ചിത്രം എടുക്കാം.
+    - 🔍 ചിത്രത്തിൽ ഒന്നിലധികം QR codes ഉണ്ടെങ്കിൽ കണ്ടെത്താൻ ശ്രമിക്കും.
+    - 📋 സ്കാൻ ചെയ്ത വിവരങ്ങൾ Copy ചെയ്യാം.
+    - 📜 സ്കാൻ History കാണാം.
+    - 📥 ഫലങ്ങൾ TXT, CSV രൂപത്തിൽ Download ചെയ്യാം.
+    """)
+
+
+# =========================================================
+# IMAGE SCANNER
+# =========================================================
+
+elif page == "📁 Image Scanner":
+
+    st.markdown("## 📁 QR Code Image Scanner")
+
+    st.write(
+        "QR Code ഉള്ള ചിത്രം Upload ചെയ്യുക. "
+        "താഴെയുള്ള ബട്ടൺ അമർത്തി സ്കാൻ ചെയ്യാം."
     )
-    if uploaded is not None:
-        if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
-            st.error(f"Image is too large. Please upload a file smaller than {MAX_UPLOAD_MB} MB.")
+
+    uploaded_file = st.file_uploader(
+        "ചിത്രം തിരഞ്ഞെടുക്കുക",
+        type=["png", "jpg", "jpeg", "webp", "bmp"],
+        key="image_upload"
+    )
+
+    if uploaded_file is not None:
+
+        try:
+            image = open_image(uploaded_file)
+
+            left, right = st.columns([1, 1])
+
+            with left:
+                st.image(
+                    image,
+                    caption="നിങ്ങൾ Upload ചെയ്ത ചിത്രം",
+                    use_container_width=True
+                )
+
+            with right:
+                st.markdown("### 🖼️ Image Details")
+                st.write(f"**File:** {uploaded_file.name}")
+                st.write(f"**Width:** {image.width}px")
+                st.write(f"**Height:** {image.height}px")
+
+                if st.button(
+                    "🔍 Scan QR Code",
+                    type="primary",
+                    use_container_width=True
+                ):
+                    with st.spinner("QR Code പരിശോധിക്കുന്നു..."):
+                        results = scan_qr_codes(image)
+
+                    if results:
+                        save_results(results, "Image Upload")
+                        st.success(
+                            f"വിജയം! {len(results)} QR ഫലം കണ്ടെത്തി."
+                        )
+                    else:
+                        st.session_state.last_scan = {
+                            "time": datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                            "source": "Image Upload",
+                            "results": []
+                        }
+
+                        st.warning(
+                            "QR Code കണ്ടെത്തിയില്ല. "
+                            "വ്യക്തമായ ചിത്രം ഉപയോഗിച്ച് വീണ്ടും ശ്രമിക്കുക."
+                        )
+
+        except Exception as error:
+            st.error(
+                "ചിത്രം തുറക്കാൻ കഴിഞ്ഞില്ല. "
+                "മറ്റൊരു ചിത്രം ഉപയോഗിച്ച് ശ്രമിക്കുക."
+            )
+
+    # ഫലങ്ങൾ
+    last = st.session_state.last_scan
+
+    if last and last["source"] == "Image Upload":
+        st.divider()
+        st.markdown("## 📋 Scan Results")
+
+        if last["results"]:
+            for index, result in enumerate(last["results"], start=1):
+                st.markdown(
+                    f"### QR Code {index}"
+                )
+
+                st.code(result, language=None)
+
+                st.download_button(
+                    "📥 Download ഈ ഫലം",
+                    data=result.encode("utf-8"),
+                    file_name=f"qr_result_{index}.txt",
+                    mime="text/plain",
+                    key=f"image_result_download_{index}"
+                )
+
+                if result.lower().startswith(("https://", "http://")):
+                    st.markdown(
+                        f"[🔗 Link തുറക്കുക]({result})"
+                    )
         else:
-            try:
-                pil_image = Image.open(uploaded)
-                pil_image = ImageOps.exif_transpose(pil_image).convert("RGB")
-                if pil_image.width * pil_image.height > 30_000_000:
-                    st.error("Image dimensions are too large to process safely.")
-                else:
-                    st.image(pil_image, caption="Uploaded image", use_container_width=True)
-                    if st.button("🔎 Scan uploaded image", type="primary", use_container_width=True):
-                        rgb = np.array(pil_image)
-                        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                        with st.spinner("Detecting and decoding QR code…"):
-                            values = decode_image(bgr)
-                        if values:
-                            set_results(values, "Gallery")
-                            st.success(f"Successfully decoded {len(values)} QR code(s).")
-                        else:
-                            st.session_state.last_error = "No QR code was found. Try a sharper image with the entire code visible."
-                            st.error(st.session_state.last_error)
-            except (OSError, ValueError, Image.DecompressionBombError) as exc:
-                st.error(f"Could not read this image: {exc}")
-            except Exception as exc:
-                st.error(f"Image processing failed: {exc}")
+            st.info("ഈ ചിത്രത്തിൽനിന്ന് QR ഫലം ലഭിച്ചിട്ടില്ല.")
 
-    if st.session_state.results and st.session_state.result_source == "Gallery":
-        st.markdown("### Decoded result")
-        for idx, result in enumerate(st.session_state.results, 1):
-            st.markdown(f'<span class="pill">{classify_payload(result)}</span>', unsafe_allow_html=True)
-            st.code(result, language=None)
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                st.button("📋 Copy result", key=f"up_copy_{idx}", on_click=lambda x=result: st.session_state.update(copy_payload=x), use_container_width=True)
-            with c2:
-                if safe_http_url(result):
-                    st.link_button("🌐 Open link", result, use_container_width=True)
 
-with history_tab:
-    st.markdown('<div class="panel"><h3>Your scan history</h3><p class="muted">Stored in a local JSON file next to main.py. Hosted platforms with temporary storage may erase it on redeployment.</p></div>', unsafe_allow_html=True)
-    search = st.text_input("Search history", placeholder="Search scanned text, URL, or content type…")
-    filter_type = st.selectbox(
-        "Filter by type",
-        ["All types", "Website URL", "Plain text", "Wi-Fi configuration", "Email", "Phone number", "Contact card", "Location", "Payment / crypto URI"],
+# =========================================================
+# CAMERA SCANNER
+# =========================================================
+
+elif page == "📸 Camera Scanner":
+
+    st.markdown("## 📸 Camera QR Scanner")
+
+    st.info(
+        "ഈ സംവിധാനം ക്യാമറയിൽനിന്ന് ഒരു ചിത്രം എടുക്കുകയാണ്. "
+        "ഇത് തുടർച്ചയായി പ്രവർത്തിക്കുന്ന live video scanner അല്ല."
     )
-    items = st.session_state.history
-    if search:
-        items = [x for x in items if search.lower() in x.get("content", "").lower()]
-    if filter_type != "All types":
-        items = [x for x in items if x.get("type") == filter_type]
-    st.caption(f"{len(items)} item(s)")
-    if not items:
-        st.info("No matching scans yet. Scan a QR code to see it here.")
-    for entry in items:
-        with st.expander(f"{'⭐ ' if entry.get('favorite') else ''}{entry.get('type', 'QR code')} · {entry.get('timestamp', '')} · {entry.get('source', '')}"):
-            st.code(entry.get("content", ""), language=None)
-            a, b, c = st.columns(3)
-            with a:
-                if st.button("📋 Copy", key=f"hist_copy_{entry['id']}", use_container_width=True):
-                    st.session_state.copy_payload = entry.get("content", "")
-                    st.rerun()
-            with b:
-                if safe_http_url(entry.get("content", "")):
-                    st.link_button("🌐 Open link", entry["content"], use_container_width=True)
-            with c:
-                if st.button("🗑️ Delete", key=f"hist_del_{entry['id']}", use_container_width=True):
-                    st.session_state.history = [x for x in st.session_state.history if x.get("id") != entry["id"]]
-                    write_history(st.session_state.history)
-                    st.rerun()
-            fav_label = "☆ Remove favorite" if entry.get("favorite") else "⭐ Add favorite"
-            if st.button(fav_label, key=f"hist_fav_{entry['id']}"):
-                for stored in st.session_state.history:
-                    if stored.get("id") == entry["id"]:
-                        stored["favorite"] = not stored.get("favorite", False)
-                write_history(st.session_state.history)
-                st.rerun()
 
-# ---------------------------- Current result ---------------------------------
-st.markdown("---")
-st.markdown("## ✨ Current result")
-if st.session_state.results:
-    st.caption(f"Source: {st.session_state.result_source or 'Unknown'}")
-    for idx, result in enumerate(st.session_state.results, 1):
-        st.markdown(f"**{idx}. {classify_payload(result)}**")
-        st.code(result, language=None)
-        cols = st.columns([1, 1, 1])
-        with cols[0]:
-            if st.button("📋 Copy", key=f"current_copy_{idx}", use_container_width=True):
-                st.session_state.copy_payload = result
-                st.rerun()
-        with cols[1]:
-            if safe_http_url(result):
-                st.link_button("🌐 Open link", result, use_container_width=True)
-        with cols[2]:
-            if st.button("✖ Clear", key=f"current_clear_{idx}", use_container_width=True):
-                st.session_state.results = []
-                st.session_state.result_source = ""
-                st.rerun()
-else:
-    st.info("Your decoded QR result will appear here.")
+    camera_image = st.camera_input(
+        "QR Code ക്യാമറയ്ക്ക് മുന്നിൽ കാണിച്ച് ചിത്രം എടുക്കുക",
+        key="camera_photo"
+    )
 
-if st.session_state.get("copy_payload"):
-    payload = st.session_state.copy_payload
-    st.markdown("**Copy this result:**")
-    st.text_area("Select and copy", value=payload, height=min(180, max(70, len(payload) // 2)), key="copy_fallback")
-    st.caption("If your browser supports clipboard access, select the text above and use Ctrl+C.")
-    if st.button("Dismiss copy panel"):
-        st.session_state.copy_payload = ""
-        st.rerun()
+    if camera_image is not None:
+
+        try:
+            image = open_image(camera_image)
+
+            st.image(
+                image,
+                caption="ക്യാമറയിൽ എടുത്ത ചിത്രം",
+                use_container_width=True
+            )
+
+            if st.button(
+                "🔍 Scan Camera Image",
+                type="primary",
+                use_container_width=True
+            ):
+                with st.spinner("ക്യാമറ ചിത്രത്തിലെ QR പരിശോധിക്കുന്നു..."):
+                    results = scan_qr_codes(image)
+
+                if results:
+                    save_results(results, "Camera")
+                    st.success(
+                        f"{len(results)} QR ഫലം കണ്ടെത്തി!"
+                    )
+                else:
+                    st.session_state.last_scan = {
+                        "time": datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                        "source": "Camera",
+                        "results": []
+                    }
+
+                    st.warning(
+                        "QR Code കണ്ടെത്തിയില്ല. "
+                        "ക്യാമറയിൽ QR Code വ്യക്തമായി കാണുന്നുണ്ടെന്ന് ഉറപ്പാക്കുക."
+                    )
+
+        except Exception:
+            st.error(
+                "ക്യാമറ ചിത്രം വായിക്കാൻ കഴിഞ്ഞില്ല. "
+                "വീണ്ടും ചിത്രം എടുത്ത് ശ്രമിക്കുക."
+            )
+
+    last = st.session_state.last_scan
+
+    if last and last["source"] == "Camera":
+        st.markdown("### 📋 Camera Scan Results")
+
+        if last["results"]:
+            for index, result in enumerate(last["results"], start=1):
+                st.write(f"**QR Code {index}**")
+                st.code(result, language=None)
+
+                st.download_button(
+                    "📥 Download Result",
+                    data=result.encode("utf-8"),
+                    file_name=f"camera_qr_{index}.txt",
+                    mime="text/plain",
+                    key=f"camera_download_{index}"
+                )
+
+                if result.lower().startswith(("https://", "http://")):
+                    st.markdown(
+                        f"[🔗 Link തുറക്കുക]({result})"
+                    )
+
+
+# =========================================================
+# SCAN HISTORY
+# =========================================================
+
+elif page == "📜 Scan History":
+
+    st.markdown("## 📜 QR Scan History")
+
+    records = st.session_state.history
+
+    if records:
+
+        st.write(f"ആകെ ഫലങ്ങൾ: **{len(records)}**")
+
+        st.dataframe(
+            records,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.download_button(
+                "📥 Download CSV",
+                data=make_csv(records),
+                file_name="qr_scan_history.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with col2:
+            txt_content = "\n\n".join(
+                f"Time: {r['Time']}\n"
+                f"Source: {r['Source']}\n"
+                f"Result: {r['Result']}"
+                for r in records
+            )
+
+            st.download_button(
+                "📄 Download TXT",
+                data=txt_content.encode("utf-8"),
+                file_name="qr_scan_history.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+
+    else:
+        st.info(
+            "ഇതുവരെ സ്കാൻ ചെയ്തിട്ടില്ല. "
+            "Image Scanner അല്ലെങ്കിൽ Camera Scanner ഉപയോഗിക്കുക."
+        )
+
+
+# =========================================================
+# ABOUT
+# =========================================================
+
+elif page == "ℹ️ About":
+
+    st.markdown("## ℹ️ QR Scanner Pro")
+
+    st.markdown("""
+    QR Scanner Pro ഒരു Python + Streamlit അടിസ്ഥാനമാക്കിയ
+    QR Code വായനാ വെബ് ആപ്ലിക്കേഷനാണ്.
+
+    ### ഉപയോഗിച്ച ടെക്നോളജികൾ
+
+    - **Python:** പ്രധാന പ്രോഗ്രാമിംഗ് ഭാഷ
+    - **Streamlit:** വെബ് ഇന്റർഫേസ്
+    - **OpenCV:** QR Code കണ്ടെത്താനും വായിക്കാനും
+    - **NumPy:** ചിത്രങ്ങൾ കൈകാര്യം ചെയ്യാൻ
+    - **Pillow:** ചിത്രങ്ങൾ തുറക്കാനും മാറ്റങ്ങൾ വരുത്താനും
+
+    ### ശ്രദ്ധിക്കുക
+
+    - ക്യാമറ പ്രവർത്തിക്കാൻ ബ്രൗസറിന്റെ അനുമതി ആവശ്യമാണ്.
+    - സ്കാൻ History നിലവിലെ Streamlit session-ൽ മാത്രമാണ് സൂക്ഷിക്കുന്നത്.
+    - App restart ചെയ്താലോ session നഷ്ടപ്പെട്ടാലോ History ഇല്ലാതാകാം.
+    - ഈ ആപ്പ് QR ഉള്ള ചിത്രങ്ങൾ സ്കാൻ ചെയ്യുന്നതാണ്; live video streaming അല്ല.
+    - QR-ൽ ലഭിക്കുന്ന ലിങ്കുകൾ തുറക്കുന്നതിന് മുമ്പ് അവ വിശ്വസനീയമാണെന്ന് പരിശോധിക്കുക.
+    """)
+
+st.divider()
 
 st.markdown(
-    '<p class="muted" style="text-align:center;margin-top:28px;">QR Scanner Pro · Decodes QR content only; it does not verify whether a QR code or destination is trustworthy.</p>',
-    unsafe_allow_html=True,
+    "<p style='text-align:center;color:#94a3b8;'>"
+    "QR Scanner Pro • Built with Python 🐍"
+    "</p>",
+    unsafe_allow_html=True
 )
