@@ -1,16 +1,3 @@
-"""
-QR SCANNER PRO — single-file Python application
-Run:
-    python -m pip install streamlit opencv-python-headless pillow numpy streamlit-webrtc
-    python -m streamlit run main.py
-
-Notes:
-- Gallery uploads use OpenCV's real QRCodeDetector.
-- Live video uses streamlit-webrtc. Browser camera access requires permission;
-  public hosting generally requires HTTPS and compatible WebRTC networking.
-- History is stored in qr_scanner_history.json beside this file.
-"""
-
 import json
 import re
 import time
